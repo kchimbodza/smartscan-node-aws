@@ -1,0 +1,19 @@
+# Credentials — never commit these
+firmware/config.py
+certs/
+*.pem
+*.key
+*.crt
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/presence_handler.zip
+
+# Python
+__pycache__/
+*.pyc
+.env
