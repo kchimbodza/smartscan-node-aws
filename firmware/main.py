@@ -4,28 +4,31 @@ Reads HC-SR04 ultrasonic sensor, detects presence, publishes to AWS IoT Core via
 """
 
 import machine
+import network
+import ntptime
 import time
 import ujson
-import ubinascii
 from umqtt.simple import MQTTClient
-import ussl
+
+import config   # config.py (copy of config.example.py): Wi-Fi, AWS endpoint, Thing name
 
 # ── Pin Configuration ─────────────────────────────────────────────────────────
 TRIG_PIN = 5
 ECHO_PIN = 18
-LED_PIN  = 2          # onboard LED, blinks on presence detection
+LED_PIN  = 2          # onboard LED, on while the room is occupied
 
 trig = machine.Pin(TRIG_PIN, machine.Pin.OUT)
 echo = machine.Pin(ECHO_PIN, machine.Pin.IN)
 led  = machine.Pin(LED_PIN, machine.Pin.OUT)
 
 # ── AWS IoT Core Configuration ────────────────────────────────────────────────
-# Replace with your AWS IoT endpoint and Thing name
-AWS_ENDPOINT  = b"YOUR_ENDPOINT.iot.us-east-1.amazonaws.com"
-THING_NAME    = b"smartscan-node-01"
-MQTT_TOPIC    = b"smartscan/presence"
-MQTT_PORT     = 8883
-CLIENT_ID     = ubinascii.hexlify(machine.unique_id())
+# Endpoint and Thing name come from config.py, so they match terraform's thing_name.
+# The client ID is the Thing name: the IoT policy only allows that client ID to connect.
+AWS_ENDPOINT = config.AWS_ENDPOINT.encode()
+THING_NAME   = config.THING_NAME
+CLIENT_ID    = THING_NAME.encode()
+MQTT_TOPIC   = b"smartscan/presence"
+MQTT_PORT    = 8883
 
 # Certs stored on ESP32 flash (upload via ampy or rshell)
 CERT_DIR  = "/certs"
@@ -37,6 +40,41 @@ KEY_FILE  = CERT_DIR + "/private.pem.key"
 PRESENCE_THRESHOLD_CM = 150   # detect presence within 150 cm
 SAMPLE_INTERVAL_S     = 5     # publish every 5 seconds
 DEBOUNCE_COUNT        = 3     # consecutive reads before state change
+
+# MicroPython's embedded ports may count time from 2000-01-01 instead of 1970-01-01
+UNIX_OFFSET = 946684800 if time.gmtime(0)[0] == 2000 else 0
+
+wlan = network.WLAN(network.STA_IF)
+
+# ── Wi-Fi and Clock ───────────────────────────────────────────────────────────
+def connect_wifi(timeout_s=20):
+    """Join the Wi-Fi network from config.py; raises OSError if it doesn't connect in time."""
+    wlan.active(True)
+    if wlan.isconnected():
+        return
+    print("Connecting to Wi-Fi:", config.WIFI_SSID)
+    wlan.connect(config.WIFI_SSID, config.WIFI_PASSWORD)
+    start = time.time()
+    while not wlan.isconnected():
+        if time.time() - start > timeout_s:
+            raise OSError("Wi-Fi connect timed out")
+        time.sleep(1)
+    print("Wi-Fi connected:", wlan.ifconfig()[0])
+
+def sync_clock(attempts=5):
+    """Set the RTC from NTP so timestamps (and the 30-day DynamoDB TTL) are real dates."""
+    for _ in range(attempts):
+        try:
+            ntptime.settime()
+            print("Clock synced (UTC):", time.gmtime())
+            return True
+        except OSError:
+            time.sleep(2)
+    print("NTP sync failed; the Lambda will use its own time for this data")
+    return False
+
+def unix_time():
+    return time.time() + UNIX_OFFSET
 
 # ── Ultrasonic Distance Measurement ──────────────────────────────────────────
 def read_distance_cm():
@@ -85,13 +123,18 @@ def connect_mqtt():
     return client
 
 # ── Publish Payload ───────────────────────────────────────────────────────────
-def publish_presence(client, distance, occupied):
-    """Build and publish JSON payload to AWS IoT Core."""
+def publish_presence(client, distance, occupied, state_changed):
+    """Build and publish JSON payload to AWS IoT Core.
+
+    state_changed is True only on the reading where the debounced state flips,
+    so the Lambda alerts once per change instead of on every 5-second reading.
+    """
     payload = ujson.dumps({
-        "device_id":   THING_NAME.decode(),
-        "distance_cm": distance,
-        "occupied":    occupied,
-        "timestamp":   time.time()
+        "device_id":     THING_NAME,
+        "distance_cm":   distance,
+        "occupied":      occupied,
+        "state_changed": state_changed,
+        "timestamp":     unix_time()
     })
     client.publish(MQTT_TOPIC, payload.encode())
     print(f"Published: {payload}")
@@ -99,6 +142,8 @@ def publish_presence(client, distance, occupied):
 
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 def main():
+    connect_wifi()
+    sync_clock()
     client = connect_mqtt()
     consecutive_occupied = 0
     consecutive_vacant   = 0
@@ -121,22 +166,25 @@ def main():
                 consecutive_vacant   += 1
                 consecutive_occupied  = 0
 
+            changed = False
             if consecutive_occupied >= DEBOUNCE_COUNT and not current_state:
-                current_state = True
-                publish_presence(client, distance, True)
+                current_state, changed = True, True
             elif consecutive_vacant >= DEBOUNCE_COUNT and current_state:
-                current_state = False
-                publish_presence(client, distance, False)
-            else:
-                # Still publish telemetry every interval for CloudWatch monitoring
-                publish_presence(client, distance, current_state)
+                current_state, changed = False, True
+
+            # Publish every interval (telemetry for DynamoDB/CloudWatch); only changes trigger alerts
+            publish_presence(client, distance, current_state, changed)
 
             time.sleep(SAMPLE_INTERVAL_S)
 
         except OSError as e:
-            print(f"MQTT error: {e} — reconnecting")
+            print(f"Network error: {e} — reconnecting")
             time.sleep(5)
-            client = connect_mqtt()
+            try:
+                connect_wifi()
+                client = connect_mqtt()
+            except OSError as e2:
+                print(f"Reconnect failed: {e2}")
 
 if __name__ == "__main__":
     main()

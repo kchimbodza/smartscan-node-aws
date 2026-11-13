@@ -12,9 +12,20 @@ provider "aws" {
 }
 
 # ── Variables ─────────────────────────────────────────────────────────────────
-variable "aws_region"  { default = "us-east-1" }
-variable "thing_name"  { default = "smartscan-node-aws-01" }
+variable "aws_region" { default = "us-east-1" }
+variable "thing_name" { default = "smartscan-node-aws-01" }
 variable "alert_email" { description = "Email for SNS occupancy alerts" }
+variable "device_csr_file" {
+  description = "Certificate signing request made on your machine (see README). The private key never leaves it."
+  default     = "../certs/device.csr"
+}
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  iot_arn_prefix = "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}"
+}
 
 # ── DynamoDB Table ────────────────────────────────────────────────────────────
 resource "aws_dynamodb_table" "occupancy" {
@@ -126,16 +137,46 @@ resource "aws_iot_thing" "node" {
   name = var.thing_name
 }
 
+# Least privilege: the device may only connect with its own Thing name as client ID,
+# and only publish to its one topic. It never subscribes, so no Subscribe/Receive.
 resource "aws_iot_policy" "node_policy" {
   name = "smartscan-node-aws-policy"
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["iot:Connect", "iot:Publish", "iot:Subscribe", "iot:Receive"]
-      Resource = "*"
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "iot:Connect"
+        Resource = "${local.iot_arn_prefix}:client/${var.thing_name}"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "iot:Publish"
+        Resource = "${local.iot_arn_prefix}:topic/smartscan/presence"
+      }
+    ]
   })
+}
+
+# Device certificate, signed by AWS from a CSR: the private key stays on your machine and
+# is not stored in Terraform state.
+resource "aws_iot_certificate" "node_cert" {
+  csr    = file(var.device_csr_file)
+  active = true
+}
+
+resource "aws_iot_policy_attachment" "node_policy" {
+  policy = aws_iot_policy.node_policy.name
+  target = aws_iot_certificate.node_cert.arn
+}
+
+resource "aws_iot_thing_principal_attachment" "node_cert" {
+  thing     = aws_iot_thing.node.name
+  principal = aws_iot_certificate.node_cert.arn
+}
+
+data "aws_iot_endpoint" "ats" {
+  endpoint_type = "iot:Data-ATS"
 }
 
 # ── IoT Rule → Lambda ─────────────────────────────────────────────────────────
@@ -159,7 +200,13 @@ resource "aws_lambda_permission" "iot_invoke" {
 }
 
 # ── Outputs ───────────────────────────────────────────────────────────────────
-output "dynamodb_table"    { value = aws_dynamodb_table.occupancy.name }
-output "lambda_function"   { value = aws_lambda_function.presence_handler.function_name }
-output "sns_topic_arn"     { value = aws_sns_topic.alerts.arn }
-output "iot_thing_name"    { value = aws_iot_thing.node.name }
+output "dynamodb_table" { value = aws_dynamodb_table.occupancy.name }
+output "lambda_function" { value = aws_lambda_function.presence_handler.function_name }
+output "sns_topic_arn" { value = aws_sns_topic.alerts.arn }
+output "iot_thing_name" { value = aws_iot_thing.node.name }
+output "iot_endpoint" { value = data.aws_iot_endpoint.ats.endpoint_address }
+output "device_certificate_pem" {
+  description = "Save as certs/certificate.pem.crt (public; the private key never left your machine)"
+  value       = aws_iot_certificate.node_cert.certificate_pem
+  sensitive   = true
+}

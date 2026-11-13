@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 340" width="960" height="340" role="img" aria-labelledby="t d">
   <title id="t">SmartScan Node architecture</title>
-  <desc id="d">At the edge, an HC-SR04 ultrasonic sensor on GPIO 5 and 18 is read by an ESP32-S3 running MicroPython every 5 seconds, with a 3-read debounce. The ESP32 publishes a JSON message over MQTT with TLS on port 8883 to AWS IoT Core on topic smartscan/presence. An IoT rule (SELECT * FROM smartscan/presence) invokes a Python 3.12 Lambda, which writes each message to the DynamoDB table smartscan-occupancy with a 30-day TTL and sends an SNS email when the message says occupied. Lambda logs go to CloudWatch Logs, kept 14 days. All AWS parts are created with Terraform.</desc>
+  <desc id="d">At the edge, an HC-SR04 ultrasonic sensor on GPIO 5 and 18 is read by an ESP32-S3 running MicroPython every 5 seconds, with a 3-read debounce. The ESP32 publishes a JSON message over MQTT with TLS on port 8883 to AWS IoT Core on topic smartscan/presence. An IoT rule (SELECT * FROM smartscan/presence) invokes a Python 3.12 Lambda, which writes each message to the DynamoDB table smartscan-occupancy with a 30-day TTL and sends an SNS email only when the room changes between occupied and vacant. Lambda logs go to CloudWatch Logs, kept 14 days. All AWS parts are created with Terraform.</desc>
   <style>
     :root { --ink:#1f2937; --sub:#57606a; --line:#d0d7de; --card:#ffffff; --on:#0d9488; --tint:#f0fdfa; --group:#f6f8fa; }
     @media (prefers-color-scheme: dark) {
@@ -84,7 +84,7 @@
   <rect class="node" x="775" y="170" width="160" height="80" rx="10"/>
   <text class="title" x="855" y="198">SNS email</text>
   <text class="sub" x="855" y="216">smartscan-alerts</text>
-  <text class="sub" x="855" y="232">sent when occupied = true</text>
+  <text class="sub" x="855" y="232">only when the state changes</text>
 
   <rect class="node" x="590" y="228" width="136" height="62" rx="10"/>
   <text class="title" x="658" y="254">CloudWatch Logs</text>
@@ -92,5 +92,5 @@
 
   <circle class="dot t1" cx="0" cy="100" r="5"/>
 
-  <text class="sub" x="480" y="328">One JSON message every 5 s: device_id, distance_cm, occupied, timestamp.</text>
+  <text class="sub" x="480" y="328">One JSON message every 5 s: device_id, distance_cm, occupied, state_changed, timestamp.</text>
 </svg>
